@@ -17,7 +17,7 @@
 --
 
 module Data.Array.Accelerate.C.Exp (
-  expToC
+  expToC, openExpToC, fun1ToC
 ) where
 
   -- standard libraries
@@ -31,41 +31,151 @@ import Language.C.Quote.C as C
 
   -- accelerate
 import Data.Array.Accelerate.Array.Sugar
-import Data.Array.Accelerate.AST
+import Data.Array.Accelerate.Array.Representation (SliceIndex(..))
+import Data.Array.Accelerate.AST                  hiding (Val(..), prj)
+import Data.Array.Accelerate.Pretty
 import Data.Array.Accelerate.Tuple
 import Data.Array.Accelerate.Type
 
   -- friends
 import Data.Array.Accelerate.C.Base
 import Data.Array.Accelerate.C.Type
-import qualified Data.Array.Accelerate.Analysis.Type    as Sugar
+import Data.Array.Accelerate.Analysis.Type
 
 
 -- Generating C code from scalar Accelerate expressions
 -- ----------------------------------------------------
 
--- Produces a list of expression whose length corresponds to the number of tuple components of the result type.
+-- Compile a closed embedded scalar expression into a list of C expression whose length corresponds to the number of tuple
+-- components of the embedded type.
 --
 expToC :: Elt t => Exp () t -> [C.Exp]
-expToC = error "IMPLEMENT THIS FUNCTION"
+expToC = openExpToC EmptyEnv EmptyEnv
 
+-- Compile an open embedded scalar unary function into a list of C expression whose length corresponds to the number of
+-- tuple components of the embedded result type. In addition ot the generated C, the types and names of the variables
+-- that need to contain the function argument are returned.
+--
+-- The expression may contain free array variables according to the array variable valuation passed as a first argument.
+--
+fun1ToC :: forall t t' aenv. (Elt t, Elt t') => Env aenv -> OpenFun () aenv (t -> t') -> ([(C.Type, Name)], [C.Exp])
+fun1ToC aenv (Lam (Body f))
+  = (bnds, openExpToC env aenv f)
+  where
+    (bnds, env) = EmptyEnv `pushExpEnv` (undefined::OpenExp () aenv t)
+fun1ToC _aenv _ = error "D.A.A.C.Exp.fun1ToC: unreachable"
+
+-- Compile an open embedded scalar expression into a list of C expression whose length corresponds to the number of tuple
+-- components of the embedded type.
+--
+-- The expression may contain free array variables according to the array variable valuation passed as a first argument.
+--
+openExpToC :: Elt t => Env env -> Env aenv -> OpenExp env aenv t -> [C.Exp]
+openExpToC = error "IMPLEMENT THIS FUNCTION"
+        
 
 -- Tuples
 -- ------
 
--- Convert a tuple index into the corresponding integer. Since the internal
--- representation is flat, be sure to walk over all sub components when indexing
--- past nested tuples.
+-- Convert a tuple index into the corresponding integer. Since the internal representation is flat, be sure to walk
+-- over all sub components when indexing past nested tuples.
 --
 prjToInt :: TupleIdx t e -> TupleType a -> Int
 prjToInt ZeroTupIdx     _                 = 0
-prjToInt (SuccTupIdx i) (b `PairTuple` a) = sizeTupleType a + prjToInt i b
-prjToInt _              _                 = error "D.A.A.C.Exp.prjToInt: inconsistent valuation"
+prjToInt (SuccTupIdx i) (b `PairTuple` a) = prjToInt i b + sizeTupleType a
+prjToInt _              t                 = error $ "D.A.A.C.Exp.prjToInt: inconsistent tuple index: " ++ show t
 
-sizeTupleType :: TupleType a -> Int
-sizeTupleType UnitTuple       = 0
-sizeTupleType (SingleTuple _) = 1
-sizeTupleType (PairTuple a b) = sizeTupleType a + sizeTupleType b
+
+-- Shapes and indices
+-- ------------------
+
+-- Restrict indices based on a slice specification. In the 'SliceAll' case we elide the 'IndexAny' from the head
+-- of slx, as this is not represented by any C term (Any ~ []).
+--
+indexSlice :: SliceIndex slix' sl co sh' -> [C.Exp] -> [C.Exp] -> [C.Exp]
+indexSlice sliceIdx slix sh =
+  let restrict :: SliceIndex slix sl co sh -> [C.Exp] -> [C.Exp] -> [C.Exp]
+      restrict SliceNil              _       _       = []
+      restrict (SliceAll   sliceIdx) slx     (sz:sl) = sz : restrict sliceIdx slx sl
+      restrict (SliceFixed sliceIdx) (_:slx) ( _:sl) =      restrict sliceIdx slx sl
+      restrict _ _ _ = error "D.A.A.C.Exp.indexSlice: unexpected shapes"
+  in
+  reverse $ restrict sliceIdx (reverse slix) (reverse sh)
+
+-- Extend indices based on a slice specification. In the SliceAll case we
+-- elide the presence of Any from the head of slx.
+--
+indexFull :: SliceIndex slix' sl' co sh -> [C.Exp] -> [C.Exp] -> [C.Exp]
+indexFull sliceIdx slix sl =
+  let extend :: SliceIndex slix sl co sh -> [C.Exp] -> [C.Exp] -> [C.Exp]
+      extend SliceNil              _        _       = []
+      extend (SliceAll   sliceIdx) slx      (sz:sh) = sz : extend sliceIdx slx sh
+      extend (SliceFixed sliceIdx) (sz:slx) sh      = sz : extend sliceIdx slx sh
+      extend _ _ _ = error "D.A.A.C.Exp.indexFull: unexpected shapes"
+  in
+  reverse $ extend sliceIdx (reverse slix) (reverse sl)
+
+-- Convert between linear and multidimensional indices.
+--
+toIndexToC :: [C.Exp] -> [C.Exp] -> [C.Exp]
+toIndexToC sh ix = [ccall "toIndex" [ccall "shape" sh, ccall "shape" ix]]
+
+-- For the multidimensional case, we've inlined the definition of 'fromIndex' because we need to return an expression
+-- for each component.
+--
+fromIndexToC :: [C.Exp] -> [C.Exp] -> [C.Exp]
+fromIndexToC sh ix
+  = reverse $ fromIndex' (reverse sh) (head ix)     -- types ensure that 'ix' is a singleton
+  where
+    fromIndex' :: [C.Exp] -> C.Exp -> [C.Exp]
+    fromIndex' []     _ = []
+    fromIndex' [_]    i = [i]
+    fromIndex' (d:ds) i = [cexp| $exp:i % $exp:d |] : fromIndex' ds [cexp| $exp:i / $exp:d |]
+
+-- Project out a single scalar element from an array. The array expression does not contain any free scalar variables
+-- (strictly flat data parallelism) and has been floated out to be replaced by an array variable.
+--
+-- FIXME: As we have a non-parametric array representation, we should bind the computed linear array index to a variable
+--        and share it in the indexing of the various array components.
+--
+indexToC :: (Shape sh, Elt e) => Env aenv -> OpenAcc aenv (Array sh e) -> [C.Exp] -> [C.Exp]
+indexToC aenv (OpenAcc (Avar idx)) ix
+  = let ((_, shName):arrNames) = prjEnv idx aenv
+    in
+    [ [cexp| $id:arr [ $exp:(toIndexWithShape shName ix) ] |] | (_, arr) <- arrNames ]
+indexToC _aenv _arr _ix = error "D.A.A.C.Exp.indexToC: array variable expected"
+
+-- Generate linear array indexing code.
+--
+-- The array argument here can only be a variable, as arrays are lifted out of expressions in an earlier phase.
+--
+linearIndexToC :: (Shape sh, Elt e) => Env aenv -> OpenAcc aenv (Array sh e) -> [C.Exp] -> [C.Exp]
+linearIndexToC aenv (OpenAcc (Avar idx)) ix
+  = [ [cexp| $id:arr [ $exp:(head ix) ] |] | (_, arr) <- tail $ prjEnv idx aenv]
+                                                      -- 'head (prjEnv idx aenv)' is the shape variable
+linearIndexToC _aenv _arr _ix = error "D.A.A.C.Exp.linearIndexToC: array variable expected"
+    
+-- Generate code to compute the shape of an array.
+--
+-- The array argument here can only be a variable, as arrays are lifted out of expressions in an earlier phase.
+--
+-- The first element (always present) in an array valuation is the array's shape variable.
+--
+shapeToC :: forall sh e aenv. (Shape sh, Elt e) => Env aenv -> OpenAcc aenv (Array sh e) -> [C.Exp]
+shapeToC aenv  (OpenAcc (Avar idx)) = cshape (sizeTupleType . eltType $ (undefined::sh)) 
+                                             [cexp| * $id:(snd . head $ prjEnv idx aenv) |]
+shapeToC _aenv _arr                 = error "D.A.A.C.Exp.shapeToC: array variable expected"
+
+-- The size of a shape, as the product of the extent in each dimension.
+--
+shapeSizeToC :: [C.Exp] -> [C.Exp]
+shapeSizeToC = (:[]) . foldl (\a b -> [cexp| $exp:a * $exp:b |]) [cexp| 1 |] 
+    
+-- Intersection of two shapes, taken as the minimum in each dimension.
+--
+intersectToC :: TupleType t -> [C.Exp] -> [C.Exp] -> [C.Exp]
+intersectToC ty sh1 sh2 = zipWith (\a b -> ccall "min" [a, b]) (ccastTup ty sh1) (ccastTup ty sh2)
+
 
 -- Primtive functions
 -- ------------------
@@ -79,18 +189,26 @@ primToC (PrimAbs             ty) [a]   = absToC ty a
 primToC (PrimSig             ty) [a]   = sigToC ty a
 primToC (PrimQuot             _) [a,b] = [cexp|$exp:a / $exp:b|]
 primToC (PrimRem              _) [a,b] = [cexp|$exp:a % $exp:b|]
-primToC (PrimIDiv            ty) [a,b] = ccall "idiv" [ccast (NumScalarType $ IntegralNumType ty) a,
-                                                       ccast (NumScalarType $ IntegralNumType ty) b]
-primToC (PrimMod             ty) [a,b] = ccall "mod"  [ccast (NumScalarType $ IntegralNumType ty) a,
-                                                       ccast (NumScalarType $ IntegralNumType ty) b]
+primToC (PrimIDiv            ty) [a,b] | isSignedIntegralType ty
+                                       = idiv  ty (ccast (NumScalarType $ IntegralNumType ty) a)
+                                                  (ccast (NumScalarType $ IntegralNumType ty) b)
+                                       | otherwise
+                                       = uidiv ty (ccast (NumScalarType $ IntegralNumType ty) a)
+                                                  (ccast (NumScalarType $ IntegralNumType ty) b)
+primToC (PrimMod             ty) [a,b] | isSignedIntegralType ty
+                                       = imod  ty (ccast (NumScalarType $ IntegralNumType ty) a)
+                                                  (ccast (NumScalarType $ IntegralNumType ty) b)
+                                       | otherwise
+                                       = uimod ty (ccast (NumScalarType $ IntegralNumType ty) a)
+                                                  (ccast (NumScalarType $ IntegralNumType ty) b)
 primToC (PrimBAnd             _) [a,b] = [cexp|$exp:a & $exp:b|]
 primToC (PrimBOr              _) [a,b] = [cexp|$exp:a | $exp:b|]
 primToC (PrimBXor             _) [a,b] = [cexp|$exp:a ^ $exp:b|]
 primToC (PrimBNot             _) [a]   = [cexp|~ $exp:a|]
 primToC (PrimBShiftL          _) [a,b] = [cexp|$exp:a << $exp:b|]
 primToC (PrimBShiftR          _) [a,b] = [cexp|$exp:a >> $exp:b|]
-primToC (PrimBRotateL         _) [a,b] = ccall "rotateL" [a,b]
-primToC (PrimBRotateR         _) [a,b] = ccall "rotateR" [a,b]
+primToC (PrimBRotateL        ty) [a,b] = rotateL ty a b
+primToC (PrimBRotateR        ty) [a,b] = rotateR ty a b
 primToC (PrimFDiv             _) [a,b] = [cexp|$exp:a / $exp:b|]
 primToC (PrimRecip           ty) [a]   = recipToC ty a
 primToC (PrimSin             ty) [a]   = ccall (FloatingNumType ty `postfix` "sin")   [a]
@@ -127,8 +245,11 @@ primToC PrimOrd                  [a]   = ordToC a
 primToC PrimChr                  [a]   = chrToC a
 primToC PrimBoolToInt            [a]   = boolToIntToC a
 primToC (PrimFromIntegral ta tb) [a]   = fromIntegralToC ta tb a
-primToC _ _ = -- If the argument lists are not the correct length
-  error "D.A.A.C.Exp.codegenPrim: inconsistent valuation"
+primToC p args = -- If the argument lists are not the correct length
+  error $ 
+    "D.A.A.C.Exp.primToC: inconsistent argument count: '" ++ (show . snd . prettyPrim $ p) ++ "' with " ++ 
+    show (length args) ++ " argument(s)"
+
 
 -- Constants and numeric types
 -- ---------------------------
@@ -282,7 +403,32 @@ ceilingToC ta tb x
 ccast :: ScalarType a -> C.Exp -> C.Exp
 ccast ty x = [cexp|($ty:(scalarTypeToC ty)) $exp:x|]
 
+ccastTup :: TupleType e -> [C.Exp] -> [C.Exp]
+ccastTup ty = fst . travTup ty
+  where
+    travTup :: TupleType e -> [C.Exp] -> ([C.Exp],[C.Exp])
+    travTup UnitTuple         xs     = ([], xs)
+    travTup (SingleTuple ty') (x:xs) = ([ccast ty' x], xs)
+    travTup (PairTuple l r)   xs     = let
+                                         (ls, xs' ) = travTup l xs
+                                         (rs, xs'') = travTup r xs'
+                                       in 
+                                       (ls ++ rs, xs'')
+    travTup _ _                      = error "D.A.A.C.Exp.ccastTup: not enough expressions to match type"
+
 postfix :: NumType a -> String -> String
 postfix (FloatingNumType (TypeFloat  _)) x = x ++ "f"
 postfix (FloatingNumType (TypeCFloat _)) x = x ++ "f"
 postfix _                                x = x
+
+isSignedIntegralType :: IntegralType a -> Bool 
+isSignedIntegralType (TypeWord{})    = False
+isSignedIntegralType (TypeWord8{})   = False
+isSignedIntegralType (TypeWord16{})  = False
+isSignedIntegralType (TypeWord32{})  = False
+isSignedIntegralType (TypeWord64{})  = False
+isSignedIntegralType (TypeCUShort{}) = False
+isSignedIntegralType (TypeCUInt{})   = False
+isSignedIntegralType (TypeCULong{})  = False
+isSignedIntegralType (TypeCULLong{}) = False
+isSignedIntegralType _               = True

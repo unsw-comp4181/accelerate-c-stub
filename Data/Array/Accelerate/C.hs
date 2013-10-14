@@ -17,7 +17,7 @@
 --
 
 module Data.Array.Accelerate.C (
-  runExpIO
+  runExpIO, runIO
 ) where
 
   -- standard libraries
@@ -39,14 +39,18 @@ import System.Posix.Temp
   -- accelerate
 import Data.Array.Accelerate.Analysis.Type as Sugar
 import Data.Array.Accelerate.Array.Sugar   as Sugar
-import Data.Array.Accelerate.Smart                      (Exp)
-import Data.Array.Accelerate.Trafo.Sharing              (convertExp)
+import Data.Array.Accelerate.AST                        (Val(..))
+import Data.Array.Accelerate.Smart                      (Exp, Acc)
+import Data.Array.Accelerate.Trafo.Sharing              (convertExp, convertAcc)
 import Data.Array.Accelerate.Type
 
   -- friends
-import Data.Array.Accelerate.C.Type
-import Data.Array.Accelerate.C.Load
+import Data.Array.Accelerate.C.Acc
+import Data.Array.Accelerate.C.Base
+import Data.Array.Accelerate.C.Execute
 import Data.Array.Accelerate.C.Exp
+import Data.Array.Accelerate.C.Load
+import Data.Array.Accelerate.C.Type
 
 
 -- Execute a scalar Accelerate computation
@@ -59,9 +63,10 @@ runExpIO e
   = do
     { let e'    = convertExp True e
           ces   = expToC e'
-          ctys  = tupleTypeToC (Sugar.expType e')
+          ctys  = tupleTypeToC $ expType e'
           resty = head ctys   -- we check for 'length ces == 1' further down
           cUnit = [cunit|
+                    $edecls:cshapeDefs
                     $ty:resty * $id:cFunName ()
                     {
                       $ty:resty *result = malloc(sizeof($ty:resty));
@@ -72,14 +77,14 @@ runExpIO e
     ; unless (length ces == 1) $
         error "Data.Array.Accelerate.C.runExpIO: result type may neither be unit nor a tuple"
 
-    ; tmpPath <- getTemporaryDirectory >>= mkdtemp
+    ; tmpPath <- addTrailingPathSeparator <$> getTemporaryDirectory >>= mkdtemp
     ; logMsgLn $ "Data.Array.Accelerate.C: temporary directory: " ++ tmpPath
     ; let cFilePath = tmpPath </> cFile
           oFilePath = tmpPath </> oFile
     ; writeFile cFilePath $ 
         "#include <stdlib.h>\n" ++
+        "#include <math.h>\n" ++
         "#include \"HsFFI.h\"\n" ++
---        "#include \"cbits/accelerate_c.h\"\n\n" ++
         (show . C.ppr $ cUnit)
     ; logMsg "Data.Array.Accelerate.C: runExpIO: compiling..."
     ; ec <- system $ unwords $ [cCompiler, "-c", cOpts, "-I" ++ ffiLibDir, "-o", oFilePath, cFilePath]
@@ -88,16 +93,17 @@ runExpIO e
         ExitSuccess   -> 
           do
           { logMsg "loading..."
-          ; mFunPtr <- load oFilePath cFunName
+          ; mFunPtr <- loadAndLookup oFilePath cFunName
           ; case mFunPtr of
               Nothing     -> error $ "Data.Array.Accelerate.C: unable to dynamically load generated code"
               Just funPtr -> 
                 do
                 { logMsg "running..."
-                ; resultPtr <- mkFun funPtr
+                ; resultPtr <- mkExpFun funPtr
                 ; logMsg "peeking..."
                 ; result    <- toElt <$> peekSingleScalar (eltType (undefined::t)) resultPtr
                 ; logMsg "unloading..."
+                ; free resultPtr
                 ; unload oFilePath
                 ; logMsgLn "done"
                 ; return result
@@ -150,6 +156,49 @@ runExpIO e
     peekNonNumScalar TypeCUChar{} ptr = peek ptr
 
 
+-- Execute an Accelerate array computation
+-- ---------------------------------------
+
+-- Compile an Accelerate array computation to C code, run it, and return the result.
+--
+runIO :: (Shape sh, Elt e) => Acc (Array sh e) -> IO (Array sh e)
+runIO acc
+  = do
+    { let acc'     = convertAcc True True True acc
+          cacc     = accToC EmptyEnv acc'
+          cUnit    = [cunit|
+                       $edecls:cshapeDefs
+                       $edecl:cacc
+                     |]
+  
+    ; tmpPath <- addTrailingPathSeparator <$> getTemporaryDirectory >>= mkdtemp
+    ; logMsgLn $ "Data.Array.Accelerate.C: temporary directory: " ++ tmpPath
+    ; let cFilePath = tmpPath </> cFile
+          oFilePath = tmpPath </> oFile
+    ; writeFile cFilePath $ 
+        "#include <stdlib.h>\n" ++
+        "#include <math.h>\n" ++
+        "#include \"HsFFI.h\"\n" ++
+        (show . C.ppr $ cUnit)
+    ; logMsg "Data.Array.Accelerate.C: runExpIO: compiling..."
+    ; ec <- system $ unwords $ [cCompiler, "-c", cOpts, "-I" ++ ffiLibDir, "-o", oFilePath, cFilePath]
+    ; case ec of
+        ExitFailure c -> error $ "Data.Array.Accelerate.C: C compiler failed with exit code " ++ show c
+        ExitSuccess   ->
+          do
+          { logMsg "loading..."
+          ; ok <- load oFilePath
+          ; unless ok $
+              error $ "Data.Array.Accelerate.C: unable to dynamically load generated code"
+          ; logMsg "running..."
+          ; result <- accExec Empty acc'
+          ; logMsg "unloading..."
+          ; unload oFilePath
+          ; logMsgLn "done"
+          ; return result
+          } }
+
+
 -- Constants
 -- ---------
 
@@ -159,13 +208,11 @@ cFile = "accelerate.c"
 oFile :: FilePath
 oFile = "accelerate.o"
 
-cFunName :: String
-cFunName = "expfun"
-
 cCompiler :: FilePath
 cCompiler = "cc"
 
 cOpts :: String
+-- cOpts = "-O2 -w"
 cOpts = "-O2"
 
 -- IMPORTANT: check this path!
@@ -190,4 +237,4 @@ logMsgLn = logMsg . (++ "\n")
 -- ---------------
 
 foreign import ccall "dynamic"
-  mkFun :: FunPtr (IO (Ptr a)) -> IO (Ptr a)
+  mkExpFun :: FunPtr (IO (Ptr a)) -> IO (Ptr a)
